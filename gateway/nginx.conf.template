@@ -11,7 +11,10 @@ http {
   }
 
   server {
+    # Railway dials the container over IPv6, so an IPv4-only listen is
+    # "connection refused" at the edge. Bind both.
     listen ${PORT};
+    listen [::]:${PORT};
     client_max_body_size 16m;
 
     # Gateway-side health for Railway probes — no proxy, no auth.
