@@ -1,0 +1,61 @@
+#!/bin/sh
+set -eu
+
+: "${API_KEYS:?API_KEYS is required (comma-separated list of allowed bearer tokens)}"
+: "${MCP_HOST:=paperclip-mcp.railway.internal}"
+: "${MCP_PORT:=8000}"
+: "${PORT:=80}"
+: "${PATH_KEY_AUTH:=false}"
+
+# Validate each key. Keys are interpolated into an nginx map regex, so we
+# restrict to characters that cannot break out of an alternation group.
+# Allowed: A-Z a-z 0-9 . _ ~ + / = -   (covers base64, base64url, hex, UUID)
+# "." and "+" are still regex metacharacters and get escaped below.
+echo "$API_KEYS" | tr ',' '\n' | while IFS= read -r key; do
+  [ -z "$key" ] && continue
+  case "$key" in
+    *[!A-Za-z0-9._~+/=-]*)
+      echo "gateway: API_KEYS contains an invalid character; allowed: A-Z a-z 0-9 . _ ~ + / = -" >&2
+      exit 1
+      ;;
+  esac
+done
+
+# Escape "." and "+" so a key like "abc.def" only matches itself, not "abcXdef".
+# Nothing else in the allowed charset is special inside a PCRE group.
+API_KEY_PATTERN=$(echo "$API_KEYS" | tr ',' '\n' | sed '/^$/d' | sed 's/[.+]/\\&/g' | paste -sd '|' -)
+if [ -z "$API_KEY_PATTERN" ]; then
+  echo "gateway: API_KEYS must contain at least one non-empty key" >&2
+  exit 1
+fi
+export API_KEY_PATTERN
+
+# Railway private DNS (*.railway.internal) is IPv6-only; pick up the container's
+# nameserver from resolv.conf so nginx can resolve it.
+RESOLVER=$(awk '/^nameserver/ {print $2; exit}' /etc/resolv.conf)
+: "${RESOLVER:=127.0.0.11}"
+# nginx requires IPv6 resolver addresses wrapped in brackets (otherwise the
+# trailing `:xx` is parsed as a port). Railway's resolv.conf is IPv6.
+case "$RESOLVER" in
+  *:*) RESOLVER="[$RESOLVER]" ;;
+esac
+export RESOLVER
+
+export MCP_HOST MCP_PORT PORT
+
+VARS='${API_KEY_PATTERN} ${RESOLVER} ${MCP_HOST} ${MCP_PORT} ${PORT}'
+
+envsubst "$VARS" < /etc/nginx/nginx.conf.template > /etc/nginx/nginx.conf
+
+# nginx has no config-level conditionals, so the keyed-path block is gated
+# here instead. The main config includes /etc/nginx/path-key.conf
+# unconditionally, so the file must exist either way — empty when disabled.
+case "$PATH_KEY_AUTH" in
+  1|true|TRUE|True|yes|YES)
+    echo "gateway: keyed-path entrypoint enabled (/k/<key>/mcp)" >&2
+    envsubst "$VARS" < /etc/nginx/path-key.conf.template > /etc/nginx/path-key.conf
+    ;;
+  *)
+    : > /etc/nginx/path-key.conf
+    ;;
+esac
