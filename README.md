@@ -34,7 +34,8 @@ The gateway talks to Paperclip through nothing but the mcp service, and the mcp 
 1. Click the Railway button 👆
 2. Fill in the variables (see below)
 3. Deploy! 🚄
-4. Point your MCP client at `https://<gateway-domain>/mcp` (streamable-HTTP, `"type": "http"`) with header `Authorization: Bearer <your-key>`. Quick check:
+4. Let Paperclip accept the private hostname (see [Reaching Paperclip](#-reaching-paperclip-over-the-private-network))
+5. Point your MCP client at `https://<gateway-domain>/mcp` (streamable-HTTP, `"type": "http"`) with header `Authorization: Bearer <your-key>`. Quick check:
    ```bash
    curl -sS -X POST https://<gateway-domain>/mcp \
      -H "Authorization: Bearer <your-key>" \
@@ -71,7 +72,7 @@ Give the domain to the gateway only. `paperclip-mcp` holds your Paperclip key an
 authentication of its own.
 
 Paperclip is external to this template. Point `PAPERCLIP_API_URL` at whichever instance
-the operator should run.
+the operator should run, and allow the hostname on that instance (see below).
 
 Needs the Railway CLI 5.42.1 or newer: the IaC engine ships in the CLI, not in the npm
 package. If you forked this repo, change `REPO` in `railway.ts` to your own before applying.
@@ -132,6 +133,28 @@ outside your control (the gateway itself logs nothing for this path). So:
 - Keys used on this path may not contain `/` (the header form allows it), since
   a slash would split the path segment.
 
+## 🔗 Reaching Paperclip over the private network
+
+Paperclip's private-hostname guard answers `403` to any request whose `Host` is not on its
+allowlist, and by default that list holds only the public hostname derived from
+`BETTER_AUTH_BASE_URL`. A request from the mcp service arrives as
+`paperclip.railway.internal`, so every tool fails with:
+
+```
+This hostname is not allowed for this Paperclip instance. If you want to allow a hostname, run npx paperclipai allowed-hostname <host>.
+```
+
+Set this on the **Paperclip** service (not on this template) and redeploy it:
+
+```
+PAPERCLIP_ALLOWED_HOSTNAMES=paperclip.railway.internal
+```
+
+It is a comma-separated list; the public hostname stays allowed. Use your Paperclip
+service's own `RAILWAY_PRIVATE_DOMAIN` if it is not named `paperclip`. The alternative is
+pointing `PAPERCLIP_API_URL` at the public URL, which works but sends every call out through
+Railway's edge instead of the private network.
+
 ## 🔒 Two layers of protection
 
 - **Bearer auth at the gateway** is the network boundary — nothing reaches the MCP without a valid key.
@@ -146,6 +169,7 @@ paperclip-mcp has **no client authentication of its own** — it binds to loopba
 - **`/health` and `/healthz` are unauthenticated** so Railway (and any uptime monitor) can probe without a token. Everything else requires `Authorization: Bearer <key>`.
 - **Invalid / missing token:** the gateway returns `401` with a `WWW-Authenticate: Bearer realm="paperclip-mcp"` header.
 - **Do not expose the mcp service publicly.** All traffic should enter through the gateway.
+- **Gateway port:** nginx listens on `PORT`, which the IaC file pins to `80`. Railway injects a random `PORT` when the variable is unset, so if you create the gateway by hand and give its domain an explicit target port, set `PORT` to match or the edge gets `connection refused`.
 - **Startup is best-effort:** the mcp service probes Paperclip's `/health` and classifies the key when it boots, but an unreachable Paperclip is logged, not fatal. Check the service logs if every tool errors.
 - **The PyPI `paperclip-mcp` package is a different project** (older, another author). This template builds the `wizarck/paperclip-mcp` source at a pinned SHA via `ARG PAPERCLIP_MCP_SHA` in `mcp/Dockerfile`, with its dependency tree frozen in `mcp/requirements.txt`. Bump the SHA and regenerate the requirements to pick up upstream changes.
 
