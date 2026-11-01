@@ -1,5 +1,6 @@
 # Builds both images this template ships (gateway and mcp) on every PR and on
-# main, and exercises the gateway's runtime-rendered nginx config.
+# main, boots the mcp server against a stub Paperclip API, and exercises the
+# gateway's runtime-rendered nginx config.
 name: docker-build
 
 on:
@@ -28,6 +29,138 @@ jobs:
           load: false
           cache-from: type=gha,scope=${{ matrix.image }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+
+  # A successful image build says nothing about the server starting on the
+  # pinned FastMCP and Python versions, so this job boots the real mcp image
+  # and drives it over MCP. There is no Paperclip image to run here, so a stub
+  # answers the two endpoints the tool calls hit, and only with the right
+  # bearer: that covers the request path, the auth header and the company id.
+  mcp-boot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build mcp image locally
+        uses: docker/build-push-action@v7
+        with:
+          context: mcp
+          push: false
+          load: true
+          tags: mcp:ci
+          cache-from: type=gha,scope=mcp
+
+      - name: Start a stub Paperclip API
+        run: |
+          set -eu
+          docker network create ci-net
+          mkdir -p stub
+          # Upstream appends "/api" to PAPERCLIP_API_URL. whoami reads
+          # /cli-auth/me and list_issues reads /companies/<id>/issues; anything
+          # else, or a missing or wrong bearer, is an error the tool surfaces.
+          cat > stub/default.conf <<'NGINX'
+          server {
+            listen 80;
+            default_type application/json;
+
+            location = /api/health {
+              return 200 '{"status":"ok","version":"ci-stub","deploymentMode":"authenticated"}';
+            }
+
+            location = /api/cli-auth/me {
+              if ($http_authorization != "Bearer pcp_board_cikey") {
+                return 401 '{"error":"Board authentication required"}';
+              }
+              return 200 '{"userId":"ci-stub-user","isInstanceAdmin":true}';
+            }
+
+            location = /api/companies/11111111-2222-3333-4444-555555555555/issues {
+              if ($http_authorization != "Bearer pcp_board_cikey") {
+                return 401 '{"error":"Board authentication required"}';
+              }
+              return 200 '[{"id":"ci-issue","identifier":"CI-1","title":"stubbed issue"}]';
+            }
+
+            location / {
+              return 404 '{"error":"not stubbed"}';
+            }
+          }
+          NGINX
+          docker run -d --name paperclip --network ci-net \
+            -v "$PWD/stub/default.conf:/etc/nginx/conf.d/default.conf:ro" \
+            nginx:1.29.8-alpine
+
+      - name: Start mcp
+        run: |
+          set -eu
+          docker run -d --name mcp --network ci-net \
+            -e PAPERCLIP_API_URL=http://paperclip \
+            -e PAPERCLIP_API_KEY=pcp_board_cikey \
+            -e PAPERCLIP_COMPANY_ID=11111111-2222-3333-4444-555555555555 \
+            -e PORT=8000 \
+            -p 8000:8000 mcp:ci
+          # There is no health route; any HTTP answer on /mcp means it is up.
+          for i in $(seq 1 30); do
+            curl -s -o /dev/null http://localhost:8000/mcp && break
+            sleep 1
+          done
+          curl -s -o /dev/null http://localhost:8000/mcp
+
+          echo "the startup probe classified the stub credential as a board key"
+          docker logs mcp 2>&1 | grep -q 'Credential: BOARD (user=ci-stub-user)'
+
+      - name: Assertions
+        run: |
+          set -eu
+          # A response is either plain JSON or SSE; keep only the JSON of the
+          # data lines in the SSE case. Each body is echoed so a failed grep
+          # shows what the server actually said.
+          call() {
+            body=$(curl -sS -D headers.txt -X POST http://localhost:8000/mcp \
+              -H 'Content-Type: application/json' \
+              -H 'Accept: application/json, text/event-stream' \
+              ${SESSION:+-H "mcp-session-id: $SESSION"} \
+              -d "$1")
+            if printf '%s\n' "$body" | grep -q '^data: '; then
+              body=$(printf '%s\n' "$body" | sed -n 's/^data: //p')
+            fi
+            printf '%s\n' "$body" | tee -a responses.log
+          }
+
+          echo "initialize succeeds and opens a session"
+          call '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}' \
+            | grep -q '"name":"paperclip"'
+          SESSION=$(tr -d '\r' < headers.txt | awk -F': ' 'tolower($1)=="mcp-session-id"{print $2}')
+          [ -n "$SESSION" ]
+          curl -sS -o /dev/null -X POST http://localhost:8000/mcp \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json, text/event-stream' \
+            -H "mcp-session-id: $SESSION" \
+            -d '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+
+          echo "tools from every module are listed"
+          tools=$(call '{"jsonrpc":"2.0","id":2,"method":"tools/list"}')
+          for t in whoami get_health list_issues create_issue list_agents approve list_goals get_cost_summary list_routines list_decisions list_pipelines; do
+            echo "$tools" | grep -q "\"name\":\"$t\""
+          done
+
+          echo "whoami reaches the stub with the bearer and returns its user"
+          whoami=$(call '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"whoami","arguments":{}}}')
+          echo "$whoami" | grep -q '"isError":false'
+          echo "$whoami" | grep -q 'ci-stub-user'
+          echo "$whoami" | grep -q '"actorType":"board"'
+
+          echo "list_issues targets the configured company"
+          issues=$(call '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"list_issues","arguments":{}}}')
+          echo "$issues" | grep -q '"isError":false'
+          echo "$issues" | grep -q 'stubbed issue'
+
+      - name: mcp logs on failure
+        if: failure()
+        run: |
+          cat headers.txt responses.log || true
+          docker logs mcp || true
+          docker logs paperclip || true
 
   # The gateway's nginx config is rendered at container start, not at build
   # time, so a broken template passes the image build and only fails once it
